@@ -12,7 +12,6 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
-	"regexp"
 	"time"
 
 	"github.com/DataDog/datadog-go/statsd"
@@ -21,9 +20,9 @@ import (
 
 type Config struct {
 	Ip                           string
-	Port                         int
-	CidrBlacklist                []net.IPNet
-	CidrBlacklistExemptions      []net.IPNet
+	Port                         uint16
+	DenyRanges                   []net.IPNet
+	AllowRanges                  []net.IPNet
 	ConnectTimeout               time.Duration
 	ExitTimeout                  time.Duration
 	MaintenanceFile              string
@@ -37,8 +36,7 @@ type Config struct {
 	AdditionalErrorMessageOnDeny string
 	Log                          *log.Logger
 	DisabledAclPolicyActions     []string
-
-	hostExtractExpr *regexp.Regexp
+	AllowMissingRole             bool
 }
 
 type missingRoleError struct {
@@ -54,64 +52,50 @@ func IsMissingRoleError(err error) bool {
 	return ok
 }
 
+func parseRanges(rangeStrings []string) ([]net.IPNet, error) {
+	outRanges := make([]net.IPNet, len(rangeStrings))
+	for i, str := range rangeStrings {
+		_, ipnet, err := net.ParseCIDR(str)
+		if err != nil {
+			return outRanges, err
+		}
+		outRanges[i] = *ipnet
+	}
+	return outRanges, nil
+}
+
+func (config *Config) SetDenyRanges(rangeStrings []string) error {
+	var err error
+	config.DenyRanges, err = parseRanges(rangeStrings)
+	return err
+}
+
+func (config *Config) SetAllowRanges(rangeStrings []string) error {
+	var err error
+	config.AllowRanges, err = parseRanges(rangeStrings)
+	return err
+}
+
 // RFC 5280,  4.2.1.1
 type authKeyId struct {
 	Id []byte `asn1:"optional,tag:0"`
 }
 
-func (config *Config) Init() error {
-	var err error
-
-	if config.CrlByAuthorityKeyId == nil {
-		config.CrlByAuthorityKeyId = make(map[string]*pkix.CertificateList)
+func NewConfig() *Config {
+	return &Config{
+		CrlByAuthorityKeyId: make(map[string]*pkix.CertificateList),
+		clientCasBySubjectKeyId: make(map[string]*x509.Certificate),
+		Log: log.New(),
+		Port: 4750,
+		ExitTimeout: 60 * time.Second,
 	}
-	if config.clientCasBySubjectKeyId == nil {
-		config.clientCasBySubjectKeyId = make(map[string]*x509.Certificate)
-	}
-	if config.Log == nil {
-		config.Log = log.New()
-	}
-
-	config.hostExtractExpr, err = regexp.Compile("^([^:]*)(:\\d+)?$")
-	if err != nil {
-		return err
-	}
-
-	// Configure RoleFromRequest for default behavior. It is ultimately meant to be replaced by the user.
-	if config.TlsConfig != nil && config.TlsConfig.ClientCAs != nil { // If client certs are set, pick the CN.
-		config.RoleFromRequest = func(req *http.Request) (string, error) {
-			fail := func(err error) (string, error) { return "", err }
-			if len(req.TLS.PeerCertificates) == 0 {
-				return fail(MissingRoleError("client did not provide certificate"))
-			}
-			return req.TLS.PeerCertificates[0].Subject.CommonName, nil
-		}
-	} else { // Use a custom header
-		config.RoleFromRequest = func(req *http.Request) (string, error) {
-			fail := func(err error) (string, error) { return "", err }
-			idHeader := req.Header["X-Smokescreen-Role"]
-			if len(idHeader) == 0 {
-				return fail(MissingRoleError("client did not send 'X-Smokescreen-Role' header"))
-			} else if len(idHeader) > 1 {
-				return fail(MissingRoleError("client sent multiple 'X-Smokescreen-Role' headers"))
-			}
-			return idHeader[0], nil
-		}
-	}
-
-	return nil
 }
 
 func (config *Config) SetupCrls(crlFiles []string) error {
-	fail := func(err error) error { fmt.Print(err); return err }
-
-	config.CrlByAuthorityKeyId = make(map[string]*pkix.CertificateList)
-	config.clientCasBySubjectKeyId = make(map[string]*x509.Certificate)
-
 	for _, crlFile := range crlFiles {
 		crlBytes, err := ioutil.ReadFile(crlFile)
 		if err != nil {
-			return fail(err)
+			return err
 		}
 
 		certList, err := x509.ParseCRL(crlBytes)
@@ -171,21 +155,26 @@ func (config *Config) SetupCrls(crlFiles []string) error {
 	return nil
 }
 
-func (config *Config) SetupStatsd(addr, namespace string) error {
+func (config *Config) SetupStatsdWithNamespace(addr, namespace string) error {
 	if addr == "" {
 		config.StatsdClient = nil
 		return nil
 	}
 
-	track, err := statsd.New(addr)
+	client, err := statsd.New(addr)
 	if err != nil {
 		return err
 	}
-	config.StatsdClient = track
+
+	config.StatsdClient = client
 
 	config.StatsdClient.Namespace = namespace
 
 	return nil
+}
+
+func (config *Config) SetupStatsd(addr string) error {
+	return config.SetupStatsdWithNamespace(addr, DefaultStatsdNamespace)
 }
 
 func (config *Config) SetupEgressAcl(aclFile string) error {
@@ -245,11 +234,11 @@ func (config *Config) SetupTls(certFile, keyFile string, clientCAFiles []string)
 		}
 	}
 
-		config.TlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{serverCert},
-			ClientAuth: clientAuth,
-			ClientCAs: clientCAs,
-		}
+	config.TlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   clientAuth,
+		ClientCAs:    clientCAs,
+	}
 
 	return nil
 }

@@ -2,7 +2,8 @@ package cmd
 
 import (
 	"errors"
-	"net"
+	"math"
+	"fmt"
 	"os"
 	"time"
 
@@ -40,10 +41,14 @@ func NewConfiguration(args []string, logger *log.Logger) (*smokescreen.Config, e
 			Usage: "Show this help text.",
 		},
 		cli.StringFlag{
+			Name:  "config-file",
+			Usage: "Load configuration from `FILE`.  Command line options override values in the file.",
+		},
+		cli.StringFlag{
 			Name:  "listen-ip",
 			Usage: "Listen on interface with address `IP`.\n\t\tThis argument is ignored when running under Einhorn. (default: any)",
 		},
-		cli.IntFlag{
+		cli.UintFlag{
 			Name:  "listen-port",
 			Value: 4750,
 			Usage: "Listen on port `PORT`.\n\t\tThis argument is ignored when running under Einhorn.",
@@ -109,62 +114,98 @@ func NewConfiguration(args []string, logger *log.Logger) (*smokescreen.Config, e
 			return errors.New("Received unexpected non-option argument(s)")
 		}
 
-		var err error
-		var cidrBlacklist []net.IPNet
-		var cidrBlacklistExemptions []net.IPNet
-
-		for _, cidrBlock := range c.StringSlice("deny-range") {
-			cidrBlacklist, err = smokescreen.AddCidrToSlice(cidrBlacklist, cidrBlock)
+		var conf *smokescreen.Config
+		if file := c.String("config-file"); file != "" {
+			var err error
+			conf, err = smokescreen.LoadConfig(file)
 			if err != nil {
+				return fmt.Errorf("Couldn't load file \"%s\" specified by --config-file: %v", file, err)
+			}
+		} else {
+			conf = smokescreen.NewConfig()
+		}
+
+		if logger != nil {
+			conf.Log = logger
+		}
+
+		if c.IsSet("listen-ip") {
+			conf.Ip = c.String("listen-ip")
+		}
+
+		if c.IsSet("listen-port") {
+			port := c.Uint("listen-port")
+			if port > math.MaxUint16 {
+				return fmt.Errorf("Invalid listen-port: %d", port)
+			}
+			conf.Port = uint16(port)
+		}
+
+		if c.IsSet("timeout") {
+			conf.ConnectTimeout = c.Duration("timeout")
+		}
+
+		if c.IsSet("maintenance-file") {
+			conf.MaintenanceFile = c.String("maintenance-file")
+		}
+
+		if c.IsSet("proxy-protocol") {
+			conf.SupportProxyProtocol = c.Bool("proxy-protocol")
+		}
+
+		if c.IsSet("additional-error-message-on-deny") {
+			conf.AdditionalErrorMessageOnDeny = c.String("additional-error-message-on-deny")
+		}
+
+		if c.IsSet("disable-acl-policy-action") {
+			conf.DisabledAclPolicyActions = c.StringSlice("disable-acl-policy-action")
+		}
+
+		if c.IsSet("deny-range") {
+			if err := conf.SetDenyRanges(c.StringSlice("deny-range")); err != nil {
 				return err
 			}
 		}
 
-		for _, cidrBlock := range c.StringSlice("allow-range") {
-			cidrBlacklistExemptions, err = smokescreen.AddCidrToSlice(cidrBlacklistExemptions, cidrBlock)
-			if err != nil {
+		if c.IsSet("allow-range") {
+			if err := conf.SetAllowRanges(c.StringSlice("allow-range")); err != nil {
 				return err
 			}
 		}
 
-		conf := &smokescreen.Config{
-			Log:                          logger,
-			Ip:                           c.String("listen-ip"),
-			Port:                         c.Int("listen-port"),
-			CidrBlacklist:                cidrBlacklist,
-			CidrBlacklistExemptions:      cidrBlacklistExemptions,
-			ConnectTimeout:               c.Duration("timeout"),
-			ExitTimeout:                  60 * time.Second,
-			MaintenanceFile:              c.String("maintenance-file"),
-			SupportProxyProtocol:         c.Bool("proxy-protocol"),
-			AdditionalErrorMessageOnDeny: c.String("additional-error-message-on-deny"),
-			DisabledAclPolicyActions:     c.StringSlice("disable-acl-policy-action"),
+		if c.IsSet("statsd-address") {
+			if err := conf.SetupStatsd(c.String("statsd-address")); err != nil {
+				return err
+			}
 		}
 
-		if err := conf.SetupStatsd(c.String("statsd-address"), "smokescreen."); err != nil {
-			return err
+		if c.IsSet("egress-acl-file") {
+			if err := conf.SetupEgressAcl(c.String("egress-acl-file")); err != nil {
+				return err
+			}
 		}
-		if err := conf.SetupEgressAcl(c.String("egress-acl-file")); err != nil {
-			return err
+
+		if c.IsSet("tls-crl-file") {
+			if err := conf.SetupCrls(c.StringSlice("tls-crl-file")); err != nil {
+				return err
+			}
 		}
-		if err := conf.SetupCrls(c.StringSlice("tls-crl-file")); err != nil {
-			return err
-		}
-		// Originally, we assumed a single file with both cert and key
-		// concatenated.  That setup will continue to work, but SetupTLS now
-		// takes separate args for cert and key, so we pass the filename twice
-		// here.
-		bundleFile := c.String("tls-server-bundle-file")
-		if bundleFile != "" {
+
+		// FIXME: mixing and matching parts of TLS config between cli and file
+		// hasn't been thought through and likely won't work
+
+		if c.IsSet("tls-server-bundle-file") {
+			// Originally, we assumed a single file with both cert and key
+			// concatenated.  That setup will continue to work, but SetupTLS now
+			// takes separate args for cert and key, so we pass the filename twice
+			// here.
+			bundleFile := c.String("tls-server-bundle-file")
 			if err := conf.SetupTls(
 				bundleFile,
 				bundleFile,
 				c.StringSlice("tls-client-ca-file")); err != nil {
 				return err
 			}
-		}
-		if err := conf.Init(); err != nil {
-			return err
 		}
 
 		configToReturn = conf
